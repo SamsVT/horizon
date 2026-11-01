@@ -924,6 +924,8 @@ pub struct Renderer {
     /// last asked (`take_dropped_sections`).
     sections_dropped: bool,
     sorted_indices: arena::Arena,
+    /// Buffers of released arena pages, freed a few frames later on a thread of their own.
+    graveyard: arena::Graveyard<wgpu::Buffer>,
     translucent_sorter: translucency::Sorter,
     translucency_cursor: usize,
     /// `DrawIndexedIndirectArgs` for this frame's solid then translucent draws.
@@ -3672,6 +3674,7 @@ impl Renderer {
             translucent_batching,
             sections_dropped: false,
             sorted_indices,
+            graveyard: Default::default(),
             translucent_sorter: translucency::Sorter::default(),
             translucency_cursor: 0,
             indirect,
@@ -4393,14 +4396,15 @@ impl Renderer {
         self.lod_pending = None;
         self.detail_columns.clear();
         self.detail_revision += 1;
-        self.arena.clear();
+        // A dimension change drops every page at once: freed later, off this thread.
+        self.graveyard.add(self.arena.clear());
         if let Some(arena) = &mut self.translucent_arena {
-            arena.clear();
+            self.graveyard.add(arena.clear());
         }
         if let Some(flat) = &mut self.flat {
             flat.clear();
         }
-        self.sorted_indices.clear();
+        self.graveyard.add(self.sorted_indices.clear());
         self.translucency_cursor = 0;
         if layout == self.layout {
             self.occlusion.clear();
@@ -5291,12 +5295,14 @@ impl Renderer {
         if !frame.title {
             self.follow_translucent_layout();
         }
-        self.arena.trim();
+        let released = self.arena.trim();
+        self.graveyard.add(released);
         let left = self.compact_arena();
         if let Some(arena) = &mut self.translucent_arena {
-            arena.trim();
+            self.graveyard.add(arena.trim());
         }
-        self.sorted_indices.trim();
+        self.graveyard.add(self.sorted_indices.trim());
+        arena::free_later(self.graveyard.advance());
         self.shrink_translucent(left);
         if let Some(flat) = &mut self.flat {
             flat.trim(|page| self.arena.has_page(page));
