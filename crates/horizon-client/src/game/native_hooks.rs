@@ -6,6 +6,18 @@
 //! Horizon's own HUD extras do, and keep a mod's settings where the
 //! WebAssembly mod of the same id kept them.
 //!
+//! API 157 adds how fire burns a mod block (`native_fire_odds`, `FireBlock.setFlammable`), and a mod block under
+//! a campfire that makes it a signal fire (`native_smoke_source`, `CampfireBlock.isSmokeSource`).
+//!
+//! API 156 adds where a loot roll happens, for a mod's own loot kinds
+//! (`NativeLootContext.place`: the origin, the block entity and the level).
+//!
+//! API 155 adds a server player taking an experience orb (`native_experience_orb_pickup`, asked for through
+//! `native_experience_orb_pickup_listened`: cancel it, or change the orb's value and count) and the Mending repair
+//! proposed for the item it picked (`native_mending_repair`).
+//!
+//! API 154 adds a player changing dimension (`native_player_changed_dimension`).
+//!
 //! API 153 adds a player starting or stopping flight, cancellable (`native_player_toggle_flight`).
 //!
 //! API 152 adds a player opening and closing a menu (`native_player_container_open`, `native_player_container_close`).
@@ -516,7 +528,7 @@ pub(super) use horizon_world::level::flags;
 /// The hook points' API version. The launcher reads this line from the
 /// source it builds; keep its form.
 #[allow(dead_code)]
-pub(crate) const NATIVE_HOOKS_API: u32 = 153;
+pub(crate) const NATIVE_HOOKS_API: u32 = 157;
 
 impl GameLevel<'_> {
     /// An authoritative server committed a changed state through `Level.setBlock`.
@@ -859,7 +871,7 @@ impl GameLevel<'_> {
     /// never burns; keep both within vanilla's 0 to 100. A waterlogged state
     /// never burns and isn't asked. Answer only for your own blocks and leave
     /// `odds` empty otherwise; the level is read-only. Asked hundreds of times
-    /// per fire tick: keep it short. API @API:fire_odds@.
+    /// per fire tick: keep it short. API 157.
     #[inline(always)]
     pub(super) fn native_fire_odds(
         &self,
@@ -874,7 +886,7 @@ impl GameLevel<'_> {
     /// block `state` under a campfire, as the campfire is placed or the block
     /// under it changes: `Some(true)` for your own blocks makes the campfire a
     /// signal fire whose smoke rises higher, as over a hay bale. The level is
-    /// read-only. API @API:fire_odds@.
+    /// read-only. API 157.
     #[inline(always)]
     pub(super) fn native_smoke_source(
         &self,
@@ -2634,7 +2646,7 @@ impl Game<'_> {
     /// heard: a move within a level (`/tp`, an End gateway), a player who
     /// leaves before the move ends, a move that ends where it started (a
     /// respawn in the dimension of the death), and anything outside a
-    /// dedicated server. @API:native_player_changed_dimension@.
+    /// dedicated server. 154.
     pub(super) fn native_player_changed_dimension(
         &mut self,
         player: u128,
@@ -3506,7 +3518,7 @@ impl Game<'_> {
     /// Whether a mod hears `native_experience_orb_pickup`: set `listened`
     /// (a HEAD injection), or the server skips swapping the player in for it,
     /// and with this empty the pickup costs nothing more without mods.
-    /// Server-side. @API:experience_orb_pickup@.
+    /// Server-side. 155.
     pub(super) fn native_experience_orb_pickup_listened(&self, listened: &mut bool) {
         let _ = listened;
     }
@@ -3514,7 +3526,7 @@ impl Game<'_> {
     /// and `count` take effect only when not canceled; value is clamped to
     /// 1..=i32::MAX and count to at least one.
     /// Canceling leaves the orb and pickup delay unchanged. Server-side.
-    /// @API:experience_orb_pickup@.
+    /// 155.
     pub(super) fn native_experience_orb_pickup(
         &mut self,
         player: u128,
@@ -3531,7 +3543,7 @@ impl Game<'_> {
     /// experience unspent when it overrides a positive proposal. If the selected
     /// stack changes, the repair is skipped.
     /// Server-side, including `native_give_experience`.
-    /// @API:experience_orb_pickup@.
+    /// 155.
     pub(super) fn native_mending_repair(
         &mut self,
         player: u128,
