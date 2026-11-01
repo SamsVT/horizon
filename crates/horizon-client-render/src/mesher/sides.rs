@@ -143,13 +143,38 @@ fn bucket(quad: &[TerrainVertex; 4]) -> usize {
 /// front to back within each axis-facing bucket; stable sorting preserves the
 /// mesher's order for coplanar overlays.
 pub fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
+    SORT_SCRATCH.with_borrow_mut(|scratch| sort_with(solid, scratch))
+}
+
+/// `sort`'s buffers, kept by each meshing thread: a section's quads went
+/// through two fresh vectors, and the sorted copy replaced the mesh's own
+/// (recycled) buffer.
+#[derive(Default)]
+struct SortScratch {
+    buckets: Vec<u8>,
+    keys: Vec<u64>,
+    sorted: Vec<[TerrainVertex; 4]>,
+}
+thread_local! {
+    static SORT_SCRATCH: std::cell::RefCell<SortScratch> = Default::default();
+}
+
+/// `f32::total_cmp`'s order as an unsigned integer's.
+fn total_order_key(v: f32) -> u32 {
+    let bits = v.to_bits() as i32;
+    (bits ^ (((bits >> 31) as u32) >> 1) as i32) as u32 ^ 0x8000_0000
+}
+
+fn sort_with(solid: &mut Vec<TerrainVertex>, scratch: &mut SortScratch) -> Sides {
     let (quads, rest) = solid.as_chunks::<4>();
     debug_assert!(rest.is_empty(), "solid vertices come in quads");
-    let buckets: Vec<u8> = quads.iter().map(|q| bucket(q) as u8).collect();
+    let buckets = &mut scratch.buckets;
+    buckets.clear();
+    buckets.extend(quads.iter().map(|q| bucket(q) as u8));
     let has_cutout = quads.iter().any(|q| q[0].layer & OPAQUE_LAYER == 0);
     let mut counts = [0u32; 7];
     let mut planes = [0f32; 7];
-    for (quad, &b) in quads.iter().zip(&buckets) {
+    for (quad, &b) in quads.iter().zip(buckets.iter()) {
         let b = usize::from(b);
         if let Bucket::Side(axis, positive) = BUCKETS[b] {
             let p = quad[0].pos[axis];
@@ -168,33 +193,34 @@ pub fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
         *end = total;
     }
     if has_cutout || counts.iter().filter(|&&c| c > 0).count() > 1 {
-        let mut next: [u32; 7] = std::array::from_fn(|b| ends[b] - counts[b]);
-        let mut sorted = vec![quads[0]; quads.len()];
-        for (quad, &b) in quads.iter().zip(&buckets) {
-            let slot = &mut next[usize::from(b)];
-            sorted[*slot as usize] = *quad;
-            *slot += 1;
-        }
-        if has_cutout {
-            let mut start = 0;
-            for (i, bucket) in BUCKETS.iter().enumerate() {
-                let end = ends[i] as usize;
-                let slice = &mut sorted[start..end];
-                if let Bucket::Side(axis, positive) = *bucket {
-                    slice.sort_by(|a, b| {
-                        let a = a[0].pos[axis];
-                        let b = b[0].pos[axis];
-                        if positive {
-                            b.total_cmp(&a)
-                        } else {
-                            a.total_cmp(&b)
+        // One integer key per quad: its bucket, then (cutout meshes, side
+        // buckets) its plane from the outside in, then its index, which keeps
+        // the order of equal quads as a stable sort does.
+        let keys = &mut scratch.keys;
+        keys.clear();
+        keys.extend(
+            quads
+                .iter()
+                .zip(buckets.iter())
+                .enumerate()
+                .map(|(i, (quad, &b))| {
+                    let plane = match BUCKETS[usize::from(b)] {
+                        Bucket::Side(axis, positive) if has_cutout => {
+                            let key = total_order_key(quad[0].pos[axis]);
+                            if positive { !key } else { key }
                         }
-                    });
-                }
-                start = end;
-            }
-        }
-        *solid = sorted.into_flattened();
+                        _ => 0,
+                    };
+                    u64::from(b) << 56 | u64::from(plane) << 24 | i as u64
+                }),
+        );
+        debug_assert!(quads.len() < 1 << 24);
+        keys.sort_unstable();
+        let sorted = &mut scratch.sorted;
+        sorted.clear();
+        sorted.extend(keys.iter().map(|&k| quads[(k & 0xFF_FFFF) as usize]));
+        solid.clear();
+        solid.extend_from_slice(sorted.as_flattened());
     }
     Sides { ends, planes }
 }
@@ -202,6 +228,69 @@ pub fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sort as it was: buckets in mesh order, then cutout side buckets
+    /// stably by plane from the outside in.
+    fn reference(solid: &[TerrainVertex]) -> Vec<TerrainVertex> {
+        let quads = solid.as_chunks::<4>().0;
+        let has_cutout = quads.iter().any(|q| q[0].layer & OPAQUE_LAYER == 0);
+        let mut sorted = Vec::new();
+        for (b, kind) in BUCKETS.iter().enumerate() {
+            let mut part: Vec<[TerrainVertex; 4]> =
+                quads.iter().filter(|q| bucket(q) == b).copied().collect();
+            if let (Bucket::Side(axis, positive), true) = (*kind, has_cutout) {
+                part.sort_by(|a, b| {
+                    let (a, b) = (a[0].pos[axis], b[0].pos[axis]);
+                    if positive {
+                        b.total_cmp(&a)
+                    } else {
+                        a.total_cmp(&b)
+                    }
+                });
+            }
+            sorted.extend(part);
+        }
+        sorted.into_flattened()
+    }
+
+    #[test]
+    fn integer_keys_sort_as_the_stable_sort_did() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..50 {
+            let mut solid = Vec::new();
+            for _ in 0..(next() % 300) {
+                let origin = [0, 1, 2].map(|_| (next() % 34) as f32 / 2.0 - 0.5);
+                // Some negative and signed-zero planes too.
+                let origin = if next() % 9 == 0 {
+                    origin.map(|v| -v)
+                } else {
+                    origin
+                };
+                let layer = if round % 3 == 0 {
+                    OPAQUE_LAYER
+                } else {
+                    (next() % 2) as u16 * OPAQUE_LAYER
+                };
+                let faces = cube(origin, layer);
+                let face = (next() % 6) as usize;
+                solid.extend_from_slice(&faces[face * 4..face * 4 + 4]);
+            }
+            let expected = reference(&solid);
+            let sides = sort(&mut solid);
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&solid),
+                bytemuck::cast_slice::<_, u8>(&expected),
+                "round {round}"
+            );
+            assert_eq!(*sides.ends.last().unwrap() as usize * 4, solid.len());
+        }
+    }
 
     fn quad(corners: [[f32; 3]; 4], layer: u16) -> [TerrainVertex; 4] {
         corners.map(|p| TerrainVertex::new(p, [0.0; 2], layer, 0, 0))
